@@ -14849,6 +14849,50 @@ function init() {
 }
 document.addEventListener('DOMContentLoaded', init);
 </script>
+<!-- Importar el SDK de Supabase vía CDN -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
+<script>
+  // Inicializar el cliente de Supabase
+  const { createClient } = supabase;
+
+  // Reemplazá esto con tus credenciales (¡dejá las comillas!)
+  const supabaseUrl = 'https://gncqvkbfkrjxpkfdbqde.supabase.co';
+  const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImduY3F2a2Jma3JqeHBrZmRicWRlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NTkyNzIsImV4cCI6MjEwMDEzNTI3Mn0.ZQ8ElDZ4J-eb3Ggmrw-w_R15eCUjQ8c4vfhXLzEaDtA';
+  
+  const supabaseClient = createClient(supabaseUrl, supabaseKey);
+
+  // Ejemplo: Función asíncrona para guardar un nuevo cliente en el CRM
+  async function agregarCliente(nombre, email, telefono) {
+    const { data, error } = await supabaseClient
+      .from('clientes') // Reemplazá 'clientes' por el nombre exacto de tu tabla
+      .insert([
+        { nombre: nombre, email: email, telefono: telefono }
+      ]);
+
+    if (error) {
+      console.error('Error al guardar:', error.message);
+    } else {
+      console.log('Cliente guardado con éxito:', data);
+    }
+  }
+
+  // Ejemplo: Función para leer los datos y mostrarlos
+  async function obtenerClientes() {
+    const { data, error } = await supabaseClient
+      .from('clientes')
+      .select('*');
+
+    if (error) {
+      console.error('Error al obtener datos:', error);
+    } else {
+      console.log('Datos desde Supabase:', data);
+      // Acá podrías armar la lógica para inyectar estos datos en el DOM de tu CRM
+    }
+  }
+
+  // Llamamos a la función para probar que conecte al cargar la página
+  obtenerClientes();
+</script>
 </body>
 </html>
