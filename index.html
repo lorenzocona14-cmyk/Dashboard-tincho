@@ -2833,6 +2833,7 @@ async function rehydratePhotosFromIDB() {
 
 function saveState() {
   try {
+    if (typeof ensureCloudIds === 'function') ensureCloudIds();
     // Crear copia del state SIN los dataUrl de las fotos (para que sea liviano)
     const lightState = JSON.parse(JSON.stringify(state, (key, value) => {
       // No serializar dataUrl: queda solo el photoRef
@@ -2840,6 +2841,7 @@ function saveState() {
       return value;
     }));
     localStorage.setItem(STORAGE_KEY, JSON.stringify(lightState));
+    if (typeof scheduleSupabaseSync === 'function') scheduleSupabaseSync();
     return true;
   } catch (e) {
     console.error('saveState error:', e);
@@ -14846,6 +14848,8 @@ function init() {
   recalc();
   // Pre-cargar SheetJS en background para que el import sea instantáneo
   setTimeout(() => { loadSheetJSIfNeeded().catch(e => console.warn('SheetJS preload failed:', e.message)); }, 1500);
+  // Sincronizar con Supabase (nube). Arranca instantáneo con lo local y luego se actualiza.
+  if (typeof bootstrapSupabaseSync === 'function') bootstrapSupabaseSync();
 }
 document.addEventListener('DOMContentLoaded', init);
 </script>
@@ -14856,43 +14860,234 @@ document.addEventListener('DOMContentLoaded', init);
   // Inicializar el cliente de Supabase
   const { createClient } = supabase;
 
-  // Reemplazá esto con tus credenciales (¡dejá las comillas!)
   const supabaseUrl = 'https://gncqvkbfkrjxpkfdbqde.supabase.co';
   const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImduY3F2a2Jma3JqeHBrZmRicWRlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NTkyNzIsImV4cCI6MjEwMDEzNTI3Mn0.ZQ8ElDZ4J-eb3Ggmrw-w_R15eCUjQ8c4vfhXLzEaDtA';
-  
+
   const supabaseClient = createClient(supabaseUrl, supabaseKey);
+  window.supabaseClient = supabaseClient;
 
-  // Ejemplo: Función asíncrona para guardar un nuevo cliente en el CRM
-  async function agregarCliente(nombre, email, telefono) {
-    const { data, error } = await supabaseClient
-      .from('clientes') // Reemplazá 'clientes' por el nombre exacto de tu tabla
-      .insert([
-        { nombre: nombre, email: email, telefono: telefono }
+  /* ============================================================
+     SINCRONIZACIÓN CRM <-> SUPABASE
+     Tablas manejadas: properties, leads, ventas, captaciones,
+     compradores, compromisos, app_config (id=1), metas (id=1)
+     ============================================================ */
+
+  // Mientras esto es true, no se empuja nada a Supabase (evita pisar
+  // la nube con datos locales viejos antes de haber podido leerla).
+  let _supaBootstrapping = true;
+
+  // Última foto de IDs por tabla, para poder detectar borrados y
+  // reflejarlos en Supabase (DELETE) en el próximo sync.
+  const _supaKnownIds = {
+    properties: null, leads: null, ventas: null,
+    captaciones: null, compradores: null, compromisos: null
+  };
+
+  let _supaSyncTimer = null;
+  let _supaSyncInFlight = false;
+  let _supaSyncQueued = false;
+
+  // Excepciones puntuales donde camelCase <-> snake_case no es 1:1 directo
+  const SUPA_SPECIAL_CAMEL_TO_SNAKE = { budgetUSD: 'budget_usd', priceUSD: 'price_usd' };
+  const SUPA_SPECIAL_SNAKE_TO_CAMEL = { budget_usd: 'budgetUSD', price_usd: 'priceUSD' };
+
+  function supaCamelToSnake(key, tableName) {
+    if (tableName === 'leads' && key === 'createdAt') return 'created_at_app';
+    if (SUPA_SPECIAL_CAMEL_TO_SNAKE[key]) return SUPA_SPECIAL_CAMEL_TO_SNAKE[key];
+    return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+  }
+  function supaSnakeToCamel(key, tableName) {
+    if (tableName === 'leads' && key === 'created_at_app') return 'createdAt';
+    // created_at / updated_at son metadata de la fila (no forman parte del state de la app)
+    if (key === 'created_at' || key === 'updated_at') return null;
+    if (SUPA_SPECIAL_SNAKE_TO_CAMEL[key]) return SUPA_SPECIAL_SNAKE_TO_CAMEL[key];
+    return key.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+  }
+  function supaRowToSnake(tableName, obj) {
+    const out = {};
+    Object.keys(obj).forEach(k => {
+      const snakeKey = supaCamelToSnake(k, tableName);
+      out[snakeKey] = obj[k] === undefined ? null : obj[k];
+    });
+    return out;
+  }
+  function supaRowToCamel(tableName, row) {
+    const out = {};
+    Object.keys(row).forEach(k => {
+      const camelKey = supaSnakeToCamel(k, tableName);
+      if (camelKey === null) return; // descartar metadata created_at/updated_at
+      out[camelKey] = row[k];
+    });
+    return out;
+  }
+
+  function supaGenId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'id_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+  }
+
+  // Las tablas ventas/captaciones/compradores/compromisos se manejaban en el
+  // front por índice de array, sin id propio. Acá les generamos uno estable
+  // (una sola vez) para poder sincronizarlas con Supabase.
+  function ensureCloudIds() {
+    ['ventas', 'captaciones', 'compradores', 'compromisos'].forEach(key => {
+      (state[key] || []).forEach(row => {
+        if (!row.id) row.id = supaGenId();
+      });
+    });
+  }
+
+  function registerKnownIds() {
+    _supaKnownIds.properties = new Set((state.properties || []).map(p => p.id).filter(Boolean));
+    _supaKnownIds.leads = new Set((state.leads || []).map(l => l.id).filter(Boolean));
+    _supaKnownIds.ventas = new Set((state.ventas || []).map(v => v.id).filter(Boolean));
+    _supaKnownIds.captaciones = new Set((state.captaciones || []).map(c => c.id).filter(Boolean));
+    _supaKnownIds.compradores = new Set((state.compradores || []).map(c => c.id).filter(Boolean));
+    _supaKnownIds.compromisos = new Set((state.compromisos || []).map(c => c.id).filter(Boolean));
+  }
+
+  async function supaSyncTable(tableName, rowsCamel) {
+    const rows = (rowsCamel || []).map(r => supaRowToSnake(tableName, r)).filter(r => r.id);
+    const currentIds = new Set(rows.map(r => r.id));
+    if (rows.length) {
+      const { error } = await supabaseClient.from(tableName).upsert(rows, { onConflict: 'id' });
+      if (error) console.warn('Supabase upsert error (' + tableName + '):', error.message);
+    }
+    const known = _supaKnownIds[tableName];
+    if (known) {
+      const removed = [...known].filter(id => !currentIds.has(id));
+      if (removed.length) {
+        const { error: delErr } = await supabaseClient.from(tableName).delete().in('id', removed);
+        if (delErr) console.warn('Supabase delete error (' + tableName + '):', delErr.message);
+      }
+    }
+    _supaKnownIds[tableName] = currentIds;
+  }
+
+  async function syncStateToSupabase() {
+    if (!window.supabaseClient || _supaBootstrapping) return;
+    if (_supaSyncInFlight) { _supaSyncQueued = true; return; }
+    _supaSyncInFlight = true;
+    try {
+      // Copia liviana (sin dataUrl de fotos, que viven en IndexedDB)
+      const light = JSON.parse(JSON.stringify(state, (key, value) => key === 'dataUrl' ? undefined : value));
+      await supaSyncTable('properties', light.properties);
+      await supaSyncTable('leads', light.leads);
+      await supaSyncTable('ventas', light.ventas);
+      await supaSyncTable('captaciones', light.captaciones);
+      await supaSyncTable('compradores', light.compradores);
+      await supaSyncTable('compromisos', light.compromisos);
+
+      const { error: cfgErr } = await supabaseClient.from('app_config').upsert({
+        id: 1,
+        brochure: (light.config && light.config.brochure) || {},
+        newsletter: (light.config && light.config.newsletter) || {}
+      }, { onConflict: 'id' });
+      if (cfgErr) console.warn('Supabase upsert error (app_config):', cfgErr.message);
+
+      const { error: metasErr } = await supabaseClient.from('metas').upsert({
+        id: 1,
+        monthly: (light.metas && light.metas.monthly) || {},
+        year_target: (light.metas && light.metas.yearTarget != null) ? light.metas.yearTarget : 40000
+      }, { onConflict: 'id' });
+      if (metasErr) console.warn('Supabase upsert error (metas):', metasErr.message);
+    } catch (e) {
+      console.warn('Supabase sync error:', e);
+    } finally {
+      _supaSyncInFlight = false;
+      if (_supaSyncQueued) { _supaSyncQueued = false; scheduleSupabaseSync(); }
+    }
+  }
+
+  function scheduleSupabaseSync() {
+    if (!window.supabaseClient || _supaBootstrapping) return;
+    clearTimeout(_supaSyncTimer);
+    _supaSyncTimer = setTimeout(() => { syncStateToSupabase(); }, 700);
+  }
+
+  async function fetchSupabaseSnapshot() {
+    if (!window.supabaseClient) return null;
+    try {
+      const [propsRes, leadsRes, ventasRes, capRes, compradoresRes, compromisosRes, configRes, metasRes] = await Promise.all([
+        supabaseClient.from('properties').select('*'),
+        supabaseClient.from('leads').select('*'),
+        supabaseClient.from('ventas').select('*'),
+        supabaseClient.from('captaciones').select('*'),
+        supabaseClient.from('compradores').select('*'),
+        supabaseClient.from('compromisos').select('*'),
+        supabaseClient.from('app_config').select('*').eq('id', 1).maybeSingle(),
+        supabaseClient.from('metas').select('*').eq('id', 1).maybeSingle()
       ]);
-
-    if (error) {
-      console.error('Error al guardar:', error.message);
-    } else {
-      console.log('Cliente guardado con éxito:', data);
+      if (propsRes.error || leadsRes.error) {
+        console.warn('Supabase fetch error:', propsRes.error || leadsRes.error);
+        return null;
+      }
+      return {
+        properties: (propsRes.data || []).map(r => supaRowToCamel('properties', r)),
+        leads: (leadsRes.data || []).map(r => supaRowToCamel('leads', r)),
+        ventas: (ventasRes.data || []).map(r => supaRowToCamel('ventas', r)),
+        captaciones: (capRes.data || []).map(r => supaRowToCamel('captaciones', r)),
+        compradores: (compradoresRes.data || []).map(r => supaRowToCamel('compradores', r)),
+        compromisos: (compromisosRes.data || []).map(r => supaRowToCamel('compromisos', r)),
+        config: configRes.data ? { brochure: configRes.data.brochure || {}, newsletter: configRes.data.newsletter || {} } : null,
+        metas: metasRes.data ? { monthly: metasRes.data.monthly || {}, yearTarget: metasRes.data.year_target } : null
+      };
+    } catch (e) {
+      console.warn('Supabase fetch exception:', e);
+      return null;
     }
   }
 
-  // Ejemplo: Función para leer los datos y mostrarlos
-  async function obtenerClientes() {
-    const { data, error } = await supabaseClient
-      .from('clientes')
-      .select('*');
+  async function bootstrapSupabaseSync() {
+    const snap = await fetchSupabaseSnapshot();
+    _supaBootstrapping = false;
 
-    if (error) {
-      console.error('Error al obtener datos:', error);
+    if (!snap) {
+      if (typeof showToast === 'function') showToast('⚠️ Sin conexión con Supabase — trabajando en modo local');
+      return;
+    }
+
+    const cloudHasData = snap.properties.length || snap.leads.length || snap.ventas.length ||
+      snap.captaciones.length || snap.compradores.length || snap.compromisos.length;
+    const localHasData = (state.properties || []).length || (state.leads || []).length;
+
+    if (cloudHasData || !localHasData) {
+      // La nube manda
+      state.properties = snap.properties;
+      state.leads = snap.leads;
+      state.ventas = snap.ventas;
+      state.captaciones = snap.captaciones;
+      state.compradores = snap.compradores;
+      state.compromisos = snap.compromisos;
+      if (snap.config) state.config = snap.config;
+      if (snap.metas) {
+        state.metas = {
+          monthly: snap.metas.monthly && Object.keys(snap.metas.monthly).length ? snap.metas.monthly : state.metas.monthly,
+          yearTarget: snap.metas.yearTarget != null ? snap.metas.yearTarget : state.metas.yearTarget
+        };
+      }
+      registerKnownIds();
+      saveState();
+      if (typeof rehydratePhotosFromIDB === 'function') rehydratePhotosFromIDB();
+      if (typeof renderHome === 'function') renderHome();
+      if (typeof renderProperties === 'function') renderProperties();
+      if (typeof renderLeads === 'function') renderLeads();
+      if (typeof renderHoy === 'function') renderHoy();
+      if (typeof showToast === 'function') showToast('☁️ Datos sincronizados con Supabase');
     } else {
-      console.log('Datos desde Supabase:', data);
-      // Acá podrías armar la lógica para inyectar estos datos en el DOM de tu CRM
+      // Supabase está vacío pero hay datos locales: los migramos a la nube
+      if (typeof showToast === 'function') showToast('☁️ Subiendo tus datos locales a Supabase…');
+      registerKnownIds(); // vacío, así el primer sync hace INSERT de todo
+      _supaKnownIds.properties = new Set();
+      _supaKnownIds.leads = new Set();
+      _supaKnownIds.ventas = new Set();
+      _supaKnownIds.captaciones = new Set();
+      _supaKnownIds.compradores = new Set();
+      _supaKnownIds.compromisos = new Set();
+      await syncStateToSupabase();
+      if (typeof showToast === 'function') showToast('✓ Datos migrados a Supabase');
     }
   }
-
-  // Llamamos a la función para probar que conecte al cargar la página
-  obtenerClientes();
 </script>
 </body>
 </html>
