@@ -14875,6 +14875,12 @@ document.addEventListener('DOMContentLoaded', init);
   // Mientras esto es true, no se empuja nada a Supabase (evita pisar
   // la nube con datos locales viejos antes de haber podido leerla).
   let _supaBootstrapping = true;
+  // Si el usuario crea/edita algo MIENTRAS todavía se está leyendo la nube
+  // por primera vez, hay que recordarlo: si no, esa edición se perdía
+  // (se ignoraba el guardado y después se pisaba todo con lo que vino
+  // de la nube, que no la incluía). Esto es lo que causaba que un lead
+  // nuevo pareciera guardado en la compu pero nunca llegara a Supabase.
+  let _supaDirtyDuringBoot = false;
 
   // Última foto de IDs por tabla, para poder detectar borrados y
   // reflejarlos en Supabase (DELETE) en el próximo sync.
@@ -14950,59 +14956,67 @@ document.addEventListener('DOMContentLoaded', init);
   async function supaSyncTable(tableName, rowsCamel) {
     const rows = (rowsCamel || []).map(r => supaRowToSnake(tableName, r)).filter(r => r.id);
     const currentIds = new Set(rows.map(r => r.id));
+    let hadError = false;
     if (rows.length) {
       const { error } = await supabaseClient.from(tableName).upsert(rows, { onConflict: 'id' });
-      if (error) console.warn('Supabase upsert error (' + tableName + '):', error.message);
+      if (error) { console.warn('Supabase upsert error (' + tableName + '):', error.message); hadError = true; }
     }
     const known = _supaKnownIds[tableName];
     if (known) {
       const removed = [...known].filter(id => !currentIds.has(id));
       if (removed.length) {
         const { error: delErr } = await supabaseClient.from(tableName).delete().in('id', removed);
-        if (delErr) console.warn('Supabase delete error (' + tableName + '):', delErr.message);
+        if (delErr) { console.warn('Supabase delete error (' + tableName + '):', delErr.message); hadError = true; }
       }
     }
     _supaKnownIds[tableName] = currentIds;
+    return hadError;
   }
 
   async function syncStateToSupabase() {
     if (!window.supabaseClient || _supaBootstrapping) return;
     if (_supaSyncInFlight) { _supaSyncQueued = true; return; }
     _supaSyncInFlight = true;
+    let anyError = false;
     try {
       // Copia liviana (sin dataUrl de fotos, que viven en IndexedDB)
       const light = JSON.parse(JSON.stringify(state, (key, value) => key === 'dataUrl' ? undefined : value));
-      await supaSyncTable('properties', light.properties);
-      await supaSyncTable('leads', light.leads);
-      await supaSyncTable('ventas', light.ventas);
-      await supaSyncTable('captaciones', light.captaciones);
-      await supaSyncTable('compradores', light.compradores);
-      await supaSyncTable('compromisos', light.compromisos);
-      await supaSyncTable('registro_diario', light.registroDiario);
+      if (await supaSyncTable('properties', light.properties)) anyError = true;
+      if (await supaSyncTable('leads', light.leads)) anyError = true;
+      if (await supaSyncTable('ventas', light.ventas)) anyError = true;
+      if (await supaSyncTable('captaciones', light.captaciones)) anyError = true;
+      if (await supaSyncTable('compradores', light.compradores)) anyError = true;
+      if (await supaSyncTable('compromisos', light.compromisos)) anyError = true;
+      if (await supaSyncTable('registro_diario', light.registroDiario)) anyError = true;
 
       const { error: cfgErr } = await supabaseClient.from('app_config').upsert({
         id: 1,
         brochure: (light.config && light.config.brochure) || {},
         newsletter: (light.config && light.config.newsletter) || {}
       }, { onConflict: 'id' });
-      if (cfgErr) console.warn('Supabase upsert error (app_config):', cfgErr.message);
+      if (cfgErr) { console.warn('Supabase upsert error (app_config):', cfgErr.message); anyError = true; }
 
       const { error: metasErr } = await supabaseClient.from('metas').upsert({
         id: 1,
         monthly: (light.metas && light.metas.monthly) || {},
         year_target: (light.metas && light.metas.yearTarget != null) ? light.metas.yearTarget : 40000
       }, { onConflict: 'id' });
-      if (metasErr) console.warn('Supabase upsert error (metas):', metasErr.message);
+      if (metasErr) { console.warn('Supabase upsert error (metas):', metasErr.message); anyError = true; }
     } catch (e) {
       console.warn('Supabase sync error:', e);
+      anyError = true;
     } finally {
       _supaSyncInFlight = false;
+      if (anyError && typeof showToast === 'function') {
+        showToast('⚠️ No se pudo guardar todo en la nube — mirá la consola (F12)');
+      }
       if (_supaSyncQueued) { _supaSyncQueued = false; scheduleSupabaseSync(); }
     }
   }
 
   function scheduleSupabaseSync() {
-    if (!window.supabaseClient || _supaBootstrapping) return;
+    if (!window.supabaseClient) return;
+    if (_supaBootstrapping) { _supaDirtyDuringBoot = true; return; }
     clearTimeout(_supaSyncTimer);
     _supaSyncTimer = setTimeout(() => { syncStateToSupabase(); }, 700);
   }
@@ -15051,6 +15065,23 @@ document.addEventListener('DOMContentLoaded', init);
       return;
     }
 
+    if (_supaDirtyDuringBoot) {
+      // El usuario ya creó/editó algo localmente mientras se leía la nube
+      // (ej: cargó un lead apenas abrió la página). No hay que pisar eso
+      // con el snapshot de la nube — al revés, hay que subirlo YA.
+      _supaKnownIds.properties = new Set(snap.properties.map(p => p.id));
+      _supaKnownIds.leads = new Set(snap.leads.map(l => l.id));
+      _supaKnownIds.ventas = new Set(snap.ventas.map(v => v.id));
+      _supaKnownIds.captaciones = new Set(snap.captaciones.map(c => c.id));
+      _supaKnownIds.compradores = new Set(snap.compradores.map(c => c.id));
+      _supaKnownIds.compromisos = new Set(snap.compromisos.map(c => c.id));
+      _supaKnownIds.registro_diario = new Set(snap.registroDiario.map(r => r.id));
+      _supaDirtyDuringBoot = false;
+      await syncStateToSupabase();
+      if (typeof showToast === 'function') showToast('☁️ Cambios locales subidos a Supabase');
+      return;
+    }
+
     const cloudHasData = snap.properties.length || snap.leads.length || snap.ventas.length ||
       snap.captaciones.length || snap.compradores.length || snap.compromisos.length || snap.registroDiario.length;
     const localHasData = (state.properties || []).length || (state.leads || []).length;
@@ -15094,6 +15125,20 @@ document.addEventListener('DOMContentLoaded', init);
       if (typeof showToast === 'function') showToast('✓ Datos migrados a Supabase');
     }
   }
+
+  // Ayuda para diagnosticar desde la consola del navegador (F12):
+  // escribí  await debugSupabaseSync()  y presioná Enter.
+  window.debugSupabaseSync = async function () {
+    console.log('supabaseClient configurado:', !!window.supabaseClient);
+    console.log('bootstrapping en curso:', _supaBootstrapping);
+    const test = await supabaseClient.from('leads').select('id,name').limit(5);
+    console.log('Últimos leads en Supabase ahora mismo:', test);
+    console.log('Leads en este navegador (local):', (state.leads || []).map(l => ({ id: l.id, name: l.name })));
+    console.log('Forzando un sync ahora...');
+    await syncStateToSupabase();
+    console.log('Sync terminado. Volvé a mirar la tabla en Supabase.');
+    return 'listo';
+  };
 </script>
 </body>
 </html>
