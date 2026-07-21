@@ -14880,7 +14880,7 @@ document.addEventListener('DOMContentLoaded', init);
   // reflejarlos en Supabase (DELETE) en el próximo sync.
   const _supaKnownIds = {
     properties: null, leads: null, ventas: null,
-    captaciones: null, compradores: null, compromisos: null
+    captaciones: null, compradores: null, compromisos: null, registro_diario: null
   };
 
   let _supaSyncTimer = null;
@@ -14930,7 +14930,7 @@ document.addEventListener('DOMContentLoaded', init);
   // front por índice de array, sin id propio. Acá les generamos uno estable
   // (una sola vez) para poder sincronizarlas con Supabase.
   function ensureCloudIds() {
-    ['ventas', 'captaciones', 'compradores', 'compromisos'].forEach(key => {
+    ['ventas', 'captaciones', 'compradores', 'compromisos', 'registroDiario'].forEach(key => {
       (state[key] || []).forEach(row => {
         if (!row.id) row.id = supaGenId();
       });
@@ -14944,6 +14944,7 @@ document.addEventListener('DOMContentLoaded', init);
     _supaKnownIds.captaciones = new Set((state.captaciones || []).map(c => c.id).filter(Boolean));
     _supaKnownIds.compradores = new Set((state.compradores || []).map(c => c.id).filter(Boolean));
     _supaKnownIds.compromisos = new Set((state.compromisos || []).map(c => c.id).filter(Boolean));
+    _supaKnownIds.registro_diario = new Set((state.registroDiario || []).map(r => r.id).filter(Boolean));
   }
 
   async function supaSyncTable(tableName, rowsCamel) {
@@ -14977,6 +14978,7 @@ document.addEventListener('DOMContentLoaded', init);
       await supaSyncTable('captaciones', light.captaciones);
       await supaSyncTable('compradores', light.compradores);
       await supaSyncTable('compromisos', light.compromisos);
+      await supaSyncTable('registro_diario', light.registroDiario);
 
       const { error: cfgErr } = await supabaseClient.from('app_config').upsert({
         id: 1,
@@ -15008,13 +15010,14 @@ document.addEventListener('DOMContentLoaded', init);
   async function fetchSupabaseSnapshot() {
     if (!window.supabaseClient) return null;
     try {
-      const [propsRes, leadsRes, ventasRes, capRes, compradoresRes, compromisosRes, configRes, metasRes] = await Promise.all([
+      const [propsRes, leadsRes, ventasRes, capRes, compradoresRes, compromisosRes, registroRes, configRes, metasRes] = await Promise.all([
         supabaseClient.from('properties').select('*'),
         supabaseClient.from('leads').select('*'),
         supabaseClient.from('ventas').select('*'),
         supabaseClient.from('captaciones').select('*'),
         supabaseClient.from('compradores').select('*'),
         supabaseClient.from('compromisos').select('*'),
+        supabaseClient.from('registro_diario').select('*'),
         supabaseClient.from('app_config').select('*').eq('id', 1).maybeSingle(),
         supabaseClient.from('metas').select('*').eq('id', 1).maybeSingle()
       ]);
@@ -15029,6 +15032,7 @@ document.addEventListener('DOMContentLoaded', init);
         captaciones: (capRes.data || []).map(r => supaRowToCamel('captaciones', r)),
         compradores: (compradoresRes.data || []).map(r => supaRowToCamel('compradores', r)),
         compromisos: (compromisosRes.data || []).map(r => supaRowToCamel('compromisos', r)),
+        registroDiario: (registroRes && !registroRes.error && registroRes.data) ? registroRes.data.map(r => supaRowToCamel('registro_diario', r)) : [],
         config: configRes.data ? { brochure: configRes.data.brochure || {}, newsletter: configRes.data.newsletter || {} } : null,
         metas: metasRes.data ? { monthly: metasRes.data.monthly || {}, yearTarget: metasRes.data.year_target } : null
       };
@@ -15048,7 +15052,7 @@ document.addEventListener('DOMContentLoaded', init);
     }
 
     const cloudHasData = snap.properties.length || snap.leads.length || snap.ventas.length ||
-      snap.captaciones.length || snap.compradores.length || snap.compromisos.length;
+      snap.captaciones.length || snap.compradores.length || snap.compromisos.length || snap.registroDiario.length;
     const localHasData = (state.properties || []).length || (state.leads || []).length;
 
     if (cloudHasData || !localHasData) {
@@ -15059,6 +15063,7 @@ document.addEventListener('DOMContentLoaded', init);
       state.captaciones = snap.captaciones;
       state.compradores = snap.compradores;
       state.compromisos = snap.compromisos;
+      state.registroDiario = snap.registroDiario;
       if (snap.config) state.config = snap.config;
       if (snap.metas) {
         state.metas = {
@@ -15084,6 +15089,7 @@ document.addEventListener('DOMContentLoaded', init);
       _supaKnownIds.captaciones = new Set();
       _supaKnownIds.compradores = new Set();
       _supaKnownIds.compromisos = new Set();
+      _supaKnownIds.registro_diario = new Set();
       await syncStateToSupabase();
       if (typeof showToast === 'function') showToast('✓ Datos migrados a Supabase');
     }
