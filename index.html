@@ -14912,6 +14912,10 @@ document.addEventListener('DOMContentLoaded', init);
   function supaRowToSnake(tableName, obj) {
     const out = {};
     Object.keys(obj).forEach(k => {
+      // Propiedades que empiezan con "_" son calculadas en el momento
+      // por el front (ej: l._temp = clasificación de temperatura del
+      // lead) y no corresponden a ninguna columna real — no se envían.
+      if (k.startsWith('_')) return;
       const snakeKey = supaCamelToSnake(k, tableName);
       out[snakeKey] = obj[k] === undefined ? null : obj[k];
     });
