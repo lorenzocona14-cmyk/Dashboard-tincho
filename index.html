@@ -14882,6 +14882,26 @@ document.addEventListener('DOMContentLoaded', init);
   // nuevo pareciera guardado en la compu pero nunca llegara a Supabase.
   let _supaDirtyDuringBoot = false;
 
+  // Indicador visual fijo con el estado de la sincronización — pensado
+  // para poder diagnosticar desde el celu, donde no hay DevTools a mano.
+  function updateSyncBadge(text, kind) {
+    let badge = document.getElementById('supa-sync-badge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'supa-sync-badge';
+      badge.style.cssText = 'position:fixed; bottom:12px; right:12px; padding:5px 10px; border-radius:5px; font-family:Manrope,sans-serif; font-size:11px; font-weight:600; z-index:9998; box-shadow:0 2px 8px rgba(0,0,0,0.15); transition:background 0.2s,color 0.2s; cursor:default;';
+      document.body.appendChild(badge);
+    }
+    const styles = {
+      ok:     'background:#e5f4ea; color:#1e7a3d;',
+      error:  'background:#fdeaea; color:#b3261e;',
+      offline:'background:#fdf3e0; color:#8a5a00;',
+      busy:   'background:#eef1f5; color:#4a5568;'
+    };
+    badge.style.cssText += styles[kind] || styles.busy;
+    badge.textContent = text;
+  }
+
   // Última foto de IDs por tabla, para poder detectar borrados y
   // reflejarlos en Supabase (DELETE) en el próximo sync.
   const _supaKnownIds = {
@@ -14981,6 +15001,7 @@ document.addEventListener('DOMContentLoaded', init);
     if (!window.supabaseClient || _supaBootstrapping) return;
     if (_supaSyncInFlight) { _supaSyncQueued = true; return; }
     _supaSyncInFlight = true;
+    updateSyncBadge('☁️ Sincronizando…', 'busy');
     let anyError = false;
     try {
       // Copia liviana (sin dataUrl de fotos, que viven en IndexedDB)
@@ -15011,8 +15032,14 @@ document.addEventListener('DOMContentLoaded', init);
       anyError = true;
     } finally {
       _supaSyncInFlight = false;
-      if (anyError && typeof showToast === 'function') {
-        showToast('⚠️ No se pudo guardar todo en la nube — mirá la consola (F12)');
+      if (anyError) {
+        updateSyncBadge('⚠️ Error al guardar en la nube', 'error');
+        if (typeof showToast === 'function') {
+          showToast('⚠️ No se pudo guardar todo en la nube — mirá la consola (F12)');
+        }
+      } else {
+        const now = new Date();
+        updateSyncBadge('☁️ Sincronizado ' + now.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }), 'ok');
       }
       if (_supaSyncQueued) { _supaSyncQueued = false; scheduleSupabaseSync(); }
     }
@@ -15061,10 +15088,12 @@ document.addEventListener('DOMContentLoaded', init);
   }
 
   async function bootstrapSupabaseSync() {
+    updateSyncBadge('☁️ Conectando…', 'busy');
     const snap = await fetchSupabaseSnapshot();
     _supaBootstrapping = false;
 
     if (!snap) {
+      updateSyncBadge('⚠️ Sin conexión con Supabase', 'offline');
       if (typeof showToast === 'function') showToast('⚠️ Sin conexión con Supabase — trabajando en modo local');
       return;
     }
@@ -15083,6 +15112,7 @@ document.addEventListener('DOMContentLoaded', init);
       _supaDirtyDuringBoot = false;
       await syncStateToSupabase();
       if (typeof showToast === 'function') showToast('☁️ Cambios locales subidos a Supabase');
+      if (typeof setupRealtimeSync === 'function') setupRealtimeSync();
       return;
     }
 
@@ -15114,6 +15144,7 @@ document.addEventListener('DOMContentLoaded', init);
       if (typeof renderLeads === 'function') renderLeads();
       if (typeof renderHoy === 'function') renderHoy();
       if (typeof showToast === 'function') showToast('☁️ Datos sincronizados con Supabase');
+      updateSyncBadge('☁️ Sincronizado', 'ok');
     } else {
       // Supabase está vacío pero hay datos locales: los migramos a la nube
       if (typeof showToast === 'function') showToast('☁️ Subiendo tus datos locales a Supabase…');
@@ -15128,7 +15159,100 @@ document.addEventListener('DOMContentLoaded', init);
       await syncStateToSupabase();
       if (typeof showToast === 'function') showToast('✓ Datos migrados a Supabase');
     }
+
+    if (typeof setupRealtimeSync === 'function') setupRealtimeSync();
   }
+
+  /* ============================================================
+     SINCRONIZACIÓN EN VIVO (Supabase Realtime)
+     Cada dispositivo con la página abierta escucha cambios de los
+     demás y actualiza su pantalla al instante, sin recargar.
+     Requiere haber corrido habilitar_realtime.sql en Supabase.
+     ============================================================ */
+
+  // Qué hacer con cada tabla cuando llega un cambio en vivo:
+  // a qué clave de `state` va, y qué pantallas hay que refrescar.
+  const REALTIME_TABLE_CONFIG = {
+    properties:      { stateKey: 'properties',    renders: () => { renderProperties(); renderHome(); } },
+    leads:           { stateKey: 'leads',          renders: () => { renderLeads(); renderHoy(); renderHome(); } },
+    ventas:          { stateKey: 'ventas',         renders: () => { if (typeof renderMetas === 'function' && document.getElementById('metas-content')) renderMetas(); renderHome(); } },
+    captaciones:     { stateKey: 'captaciones',    renders: () => { if (typeof renderMetas === 'function' && document.getElementById('metas-content')) renderMetas(); } },
+    compradores:     { stateKey: 'compradores',    renders: () => { if (typeof renderMetas === 'function' && document.getElementById('metas-content')) renderMetas(); } },
+    compromisos:     { stateKey: 'compromisos',    renders: () => { if (typeof renderMetas === 'function' && document.getElementById('metas-content')) renderMetas(); renderHoy(); } },
+    registro_diario: { stateKey: 'registroDiario', renders: () => { renderHome(); } }
+  };
+
+  function applyRealtimeChange(tableName, eventType, newRow, oldRow) {
+    const cfg = REALTIME_TABLE_CONFIG[tableName];
+    if (!cfg) return; // app_config / metas se manejan aparte
+    if (!Array.isArray(state[cfg.stateKey])) state[cfg.stateKey] = [];
+    const arr = state[cfg.stateKey];
+
+    if (eventType === 'DELETE') {
+      const id = oldRow && oldRow.id;
+      if (id) {
+        const idx = arr.findIndex(r => r.id === id);
+        if (idx !== -1) arr.splice(idx, 1);
+        if (_supaKnownIds[tableName]) _supaKnownIds[tableName].delete(id);
+      }
+    } else {
+      const camel = supaRowToCamel(tableName, newRow);
+      const idx = arr.findIndex(r => r.id === camel.id);
+      if (idx !== -1) arr[idx] = camel; else arr.push(camel);
+      if (_supaKnownIds[tableName]) _supaKnownIds[tableName].add(camel.id);
+    }
+
+    // Actualiza el caché local (localStorage) sin volver a empujar a
+    // Supabase — este cambio ya vino DE Supabase, reenviarlo sería
+    // un eco innecesario (aunque inofensivo, porque es idempotente).
+    try {
+      const lightState = JSON.parse(JSON.stringify(state, (key, value) => key === 'dataUrl' ? undefined : value));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(lightState));
+    } catch (e) { console.warn('No se pudo cachear localmente:', e); }
+
+    try { cfg.renders(); } catch (e) { console.warn('Error al refrescar pantalla tras cambio en vivo:', e); }
+  }
+
+  let _supaRealtimeChannel = null;
+
+  function setupRealtimeSync() {
+    if (!window.supabaseClient || _supaRealtimeChannel) return;
+
+    const channel = supabaseClient.channel('crm-live-sync');
+
+    Object.keys(REALTIME_TABLE_CONFIG).forEach(tableName => {
+      channel.on('postgres_changes', { event: '*', schema: 'public', table: tableName }, (payload) => {
+        applyRealtimeChange(tableName, payload.eventType, payload.new, payload.old);
+      });
+    });
+
+    // app_config y metas son una sola fila (id=1): se pisan directo.
+    channel.on('postgres_changes', { event: '*', schema: 'public', table: 'app_config' }, (payload) => {
+      if (payload.new) {
+        state.config = { brochure: payload.new.brochure || {}, newsletter: payload.new.newsletter || {} };
+        if (typeof renderFolleto === 'function' && document.getElementById('folleto-content')) renderFolleto();
+        if (typeof renderNewsletter === 'function' && document.getElementById('newsletter-content')) renderNewsletter();
+      }
+    });
+    channel.on('postgres_changes', { event: '*', schema: 'public', table: 'metas' }, (payload) => {
+      if (payload.new) {
+        state.metas = { monthly: payload.new.monthly || {}, yearTarget: payload.new.year_target };
+        if (typeof renderMetas === 'function' && document.getElementById('metas-content')) renderMetas();
+        if (typeof renderHome === 'function') renderHome();
+      }
+    });
+
+    channel.subscribe((status) => {
+      if (status === 'SUBSCRIBED') {
+        updateSyncBadge('🔴 En vivo', 'ok');
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        updateSyncBadge('⚠️ Sin tiempo real (revisá habilitar_realtime.sql)', 'offline');
+      }
+    });
+
+    _supaRealtimeChannel = channel;
+  }
+
 
   // Ayuda para diagnosticar desde la consola del navegador (F12):
   // escribí  await debugSupabaseSync()  y presioná Enter.
